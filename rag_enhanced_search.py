@@ -131,19 +131,36 @@ class RAGEnhancedSearchSystem:
             raise
 
     def _init_vector_index(self):
-        """Initialize FAISS vector index"""
+        """Initialize FAISS vector index with improved error handling"""
         try:
+            # Ensure directory exists for index file
+            index_dir = os.path.dirname(self.vector_index_path) if os.path.dirname(self.vector_index_path) else "."
+            os.makedirs(index_dir, exist_ok=True)
+
             # Try to load existing index
             if os.path.exists(self.vector_index_path):
-                self.vector_index = faiss.read_index(self.vector_index_path)
-                logger.info(f"Loaded existing vector index: {self.vector_index_path}")
+                try:
+                    self.vector_index = faiss.read_index(self.vector_index_path)
+                    logger.info(f"Loaded existing vector index: {self.vector_index_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load existing index, creating new one: {e}")
+                    self.vector_index = faiss.IndexFlatIP(self.embedding_dimension)
+                    logger.info("Created new vector index after load failure")
             else:
-                # Create new index
-                self.vector_index = faiss.IndexFlatIP(self.embedding_dimension)
-                logger.info("Created new vector index")
+                # Create new index with optimized configuration
+                if self.embedding_dimension <= 128:
+                    # Use exact search for smaller dimensions
+                    self.vector_index = faiss.IndexFlatIP(self.embedding_dimension)
+                else:
+                    # Use approximate search for larger dimensions
+                    quantizer = faiss.IndexFlatIP(self.embedding_dimension)
+                    self.vector_index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, 100)
+                logger.info(f"Created new vector index with dimension {self.embedding_dimension}")
         except Exception as e:
             logger.error(f"Failed to initialize vector index: {e}")
-            raise
+            # Fallback to basic flat index
+            self.vector_index = faiss.IndexFlatIP(self.embedding_dimension)
+            logger.info("Using fallback flat vector index")
 
     def _create_tables(self):
         """Create DuckDB tables for structured data"""
@@ -321,37 +338,79 @@ class RAGEnhancedSearchSystem:
         logger.info(f"Created {len(self.documents)} document chunks")
 
     def _create_embeddings(self) -> None:
-        """Create embeddings for all documents and build vector index"""
+        """Create embeddings for all documents and build vector index with optimizations"""
         if not self.documents:
             logger.warning("No documents to create embeddings for")
             return
 
         try:
-            # Extract text content
-            texts = [doc.page_content for doc in self.documents]
+            # Extract text content and filter empty documents
+            texts = [doc.page_content for doc in self.documents if doc.page_content.strip()]
 
-            # Create embeddings in batches
+            if not texts:
+                logger.warning("No valid text content found in documents")
+                return
+
+            logger.info(f"Creating embeddings for {len(texts)} documents...")
+
+            # Create embeddings in batches with progress tracking
             batch_size = 32
             embeddings = []
+            total_batches = (len(texts) + batch_size - 1) // batch_size
 
             for i in range(0, len(texts), batch_size):
                 batch_texts = texts[i:i + batch_size]
-                batch_embeddings = self.embedding_model.encode(batch_texts, normalize_embeddings=True)
-                embeddings.extend(batch_embeddings)
+
+                # Create embeddings with error handling for individual batches
+                try:
+                    batch_embeddings = self.embedding_model.encode(
+                        batch_texts,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                        convert_to_numpy=True
+                    )
+                    embeddings.extend(batch_embeddings)
+
+                    if (i // batch_size + 1) % 10 == 0:  # Log progress every 10 batches
+                        logger.info(f"Processed batch {i // batch_size + 1}/{total_batches}")
+
+                except Exception as batch_error:
+                    logger.warning(f"Failed to process batch {i // batch_size + 1}: {batch_error}")
+                    # Add zero embeddings for failed batch
+                    zero_embeddings = np.zeros((len(batch_texts), self.embedding_dimension))
+                    embeddings.extend(zero_embeddings)
 
             self.document_embeddings = np.array(embeddings).astype('float32')
 
+            # Initialize FAISS index if using IVF
+            if hasattr(self.vector_index, 'is_trained') and not self.vector_index.is_trained:
+                if len(self.document_embeddings) >= 100:  # Need enough training data
+                    self.vector_index.train(self.document_embeddings)
+                    logger.info("Trained IVF index")
+                else:
+                    # Fallback to flat index for small datasets
+                    self.vector_index = faiss.IndexFlatIP(self.embedding_dimension)
+                    logger.info("Using flat index for small dataset")
+
             # Add to FAISS index
-            self.vector_index.reset()  # Clear existing index
+            if hasattr(self.vector_index, 'reset'):
+                self.vector_index.reset()  # Clear existing index
+
             self.vector_index.add(self.document_embeddings)
 
-            # Save index
-            faiss.write_index(self.vector_index, self.vector_index_path)
+            # Save index with error handling
+            try:
+                faiss.write_index(self.vector_index, self.vector_index_path)
+                logger.info(f"Saved vector index to {self.vector_index_path}")
+            except Exception as save_error:
+                logger.warning(f"Failed to save vector index: {save_error}")
 
-            logger.info(f"Created embeddings for {len(self.documents)} documents")
+            logger.info(f"Successfully created embeddings for {len(self.documents)} documents")
 
         except Exception as e:
             logger.error(f"Failed to create embeddings: {e}")
+            # Create empty embeddings as fallback
+            self.document_embeddings = np.empty((0, self.embedding_dimension), dtype='float32')
             raise
 
     def hybrid_search(self,
@@ -592,7 +651,7 @@ class RAGEnhancedSearchSystem:
 
             # Generate response using OpenAI
             response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}

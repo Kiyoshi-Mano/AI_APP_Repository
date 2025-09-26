@@ -529,6 +529,11 @@ def llm_to_json_spec(question: str, columns: List[str]) -> Dict[str, Any]:
   "free_text_search": {{"enabled": true|false, "keywords": ["keyword1", "keyword2"], "target_columns": ["故障状況", "不具合内容", "作業内容", "作業明細備考", "部品品名"]}}
 }}
 
+**重要**: metrics[].name は最終テーブルの列名として使用されます。
+- expr:"count" の場合: groupbyのサイズ（全レコード数）を集計し、列名は必ずname（例："name": "件数"）
+- expr:"sum:<列名>" の場合: 合計結果の列名は必ずname（例："name": "数量合計"）
+- 人間が理解しやすい列名を使用してください（「件数」「合計」「平均値」など）
+
 特別な検索機能:
 - fuzzy_search: あいまい検索（類似した文字列も検索）
 - free_text_search: フリーワード検索（複数の列を横断して検索）
@@ -539,7 +544,7 @@ JSONのみを出力してください。説明は不要です。"""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
@@ -555,7 +560,17 @@ JSONのみを出力してください。説明は不要です。"""
         return json.loads(json_text)
 
     except Exception as e:
-        st.error(f"OpenAI API エラー: {str(e)}")
+        error_msg = f"OpenAI API エラー: {str(e)}"
+
+        # Add helpful information for common errors
+        if "API key" in str(e) or "authentication" in str(e).lower():
+            error_msg += "\n\n💡 API キーを確認してください"
+        elif "rate limit" in str(e).lower() or "quota" in str(e).lower():
+            error_msg += "\n\n💡 API使用量制限に達しました。しばらく待ってから再試行してください"
+        elif "timeout" in str(e).lower():
+            error_msg += "\n\n💡 接続がタイムアウトしました。再試行してください"
+
+        st.error(error_msg)
         return {}
 
 def execute_spec(df_cases: pd.DataFrame, df_parts: pd.DataFrame, spec: Dict[str, Any]) -> pd.DataFrame:
@@ -626,75 +641,118 @@ def execute_spec(df_cases: pd.DataFrame, df_parts: pd.DataFrame, spec: Dict[str,
 
                 df = df[search_mask]
 
-        # Group by and aggregate
+        # Get groupby columns
         groupby_cols = [col for col in spec.get('groupby', []) if col in df.columns]
 
-        # Build aggregation dict
-        agg_dict = {}
+        # Process metrics safely - create DataFrame for each metric and merge
+        metric_frames = []
         for metric in spec.get('metrics', []):
-            name = metric.get('name', 'result')
+            metric_name = metric.get('name')
             expr = metric.get('expr', 'count')
 
-            if expr == 'count':
-                agg_dict[name] = ('整備案件NO', 'count') if '整備案件NO' in df.columns else (df.columns[0], 'count')
-            elif expr.startswith('sum:'):
-                col = expr.split(':', 1)[1]
-                if col in df.columns:
-                    agg_dict[name] = (col, 'sum')
-            elif expr.startswith('mean:'):
-                col = expr.split(':', 1)[1]
-                if col in df.columns:
-                    agg_dict[name] = (col, 'mean')
+            if not metric_name:
+                continue
 
-        if not agg_dict:
-            agg_dict = {'件数': (df.columns[0], 'count')}
+            if groupby_cols:
+                # With groupby
+                grouped = df.groupby(groupby_cols, dropna=False)
 
-        # Perform aggregation
-        if groupby_cols:
-            result_df = df.groupby(groupby_cols).agg(agg_dict).reset_index()
-        else:
-            # Global aggregation (no groupby)
-            agg_result = {}
-            for name, (col, func) in agg_dict.items():
-                if func == 'count':
-                    agg_result[name] = len(df)
-                elif func == 'sum':
-                    agg_result[name] = df[col].sum() if col in df.columns else 0
-                elif func == 'mean':
-                    agg_result[name] = df[col].mean() if col in df.columns else 0
-            result_df = pd.DataFrame([agg_result])
-
-        # Flatten column names (only needed for groupby results)
-        if groupby_cols:
-            new_columns = []
-            for col in result_df.columns:
-                if isinstance(col, tuple):
-                    # For aggregated columns, use the metric name (key from agg_dict)
-                    for metric_name, _ in agg_dict.items():
-                        if col[0] == metric_name:
-                            new_columns.append(metric_name)
-                            break
-                    else:
-                        new_columns.append(col[0])
+                if expr == 'count':
+                    # Use size() to get total record count
+                    metric_result = grouped.size().rename(metric_name).reset_index()
+                elif expr.startswith('sum:'):
+                    col_name = expr.split(':', 1)[1]
+                    if col_name not in df.columns:
+                        df[col_name] = 0  # Create missing column with zeros
+                    # Convert to numeric and handle errors
+                    df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+                    metric_result = grouped[col_name].sum().rename(metric_name).reset_index()
+                elif expr.startswith('mean:'):
+                    col_name = expr.split(':', 1)[1]
+                    if col_name not in df.columns:
+                        df[col_name] = 0
+                    df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+                    metric_result = grouped[col_name].mean().rename(metric_name).reset_index()
                 else:
-                    new_columns.append(col)
-            result_df.columns = new_columns
+                    raise ValueError(f"Unsupported expression: {expr}")
 
-        # Sort and limit
-        sort_by = spec.get('sort', {}).get('by', '件数')
-        sort_asc = spec.get('sort', {}).get('asc', False)
+            else:
+                # No groupby - global aggregation
+                if expr == 'count':
+                    metric_result = pd.DataFrame({metric_name: [len(df)]})
+                elif expr.startswith('sum:'):
+                    col_name = expr.split(':', 1)[1]
+                    if col_name not in df.columns:
+                        df[col_name] = 0
+                    col_sum = pd.to_numeric(df[col_name], errors='coerce').fillna(0).sum()
+                    metric_result = pd.DataFrame({metric_name: [col_sum]})
+                elif expr.startswith('mean:'):
+                    col_name = expr.split(':', 1)[1]
+                    if col_name not in df.columns:
+                        df[col_name] = 0
+                    col_mean = pd.to_numeric(df[col_name], errors='coerce').fillna(0).mean()
+                    metric_result = pd.DataFrame({metric_name: [col_mean]})
+                else:
+                    raise ValueError(f"Unsupported expression: {expr}")
 
-        if sort_by in result_df.columns:
-            result_df = result_df.sort_values(sort_by, ascending=sort_asc)
+            metric_frames.append(metric_result)
 
-        topn = spec.get('topn', 10)
-        if topn and len(result_df) > topn:
+        # Combine all metrics
+        if not metric_frames:
+            # Default to count if no metrics specified
+            if groupby_cols:
+                result_df = df.groupby(groupby_cols, dropna=False).size().rename('件数').reset_index()
+            else:
+                result_df = pd.DataFrame({'件数': [len(df)]})
+        else:
+            result_df = metric_frames[0]
+            for metric_frame in metric_frames[1:]:
+                if groupby_cols:
+                    # Merge on groupby columns
+                    result_df = result_df.merge(metric_frame, on=groupby_cols, how='outer')
+                else:
+                    # Concatenate columns for global metrics
+                    result_df = pd.concat([result_df, metric_frame], axis=1)
+
+        # Safe sorting
+        sort_spec = spec.get('sort', {})
+        sort_by = sort_spec.get('by', '件数')
+        sort_asc = sort_spec.get('asc', False)
+
+        # Check if sort column exists, fallback to first metric column
+        if sort_by not in result_df.columns:
+            metric_names = [m.get('name') for m in spec.get('metrics', []) if m.get('name') in result_df.columns]
+            if metric_names:
+                sort_by = metric_names[0]
+            elif '件数' in result_df.columns:
+                sort_by = '件数'
+            else:
+                sort_by = None
+
+        if sort_by and sort_by in result_df.columns:
+            # Convert to numeric for proper sorting
+            result_df[sort_by] = pd.to_numeric(result_df[sort_by], errors='ignore')
+            result_df = result_df.sort_values(by=sort_by, ascending=sort_asc, kind='mergesort')
+
+        # Apply topn limit
+        topn = spec.get('topn')
+        if isinstance(topn, int) and topn > 0:
             result_df = result_df.head(topn)
 
-        return result_df
+        # Clean up and return
+        return result_df.reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"クエリ実行エラー: {str(e)}")
+        error_msg = f"クエリ実行エラー: {str(e)}"
+
+        # Add helpful debugging information
+        if "Column(s)" in str(e) and "do not exist" in str(e):
+            error_msg += "\n\n💡 ヒント:\n"
+            error_msg += "• より広い条件で検索する\n"
+            error_msg += "• 期間を変更する\n"
+            error_msg += "• 異なる項目で集計する"
+
+        st.error(error_msg)
         return pd.DataFrame()
 
 def generate_natural_response(question: str, result_df: pd.DataFrame, spec: Dict[str, Any]) -> str:
@@ -732,7 +790,7 @@ def generate_natural_response(question: str, result_df: pd.DataFrame, spec: Dict
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": result_summary}
@@ -768,87 +826,141 @@ def qa_chat(df_cases: pd.DataFrame, df_parts: pd.DataFrame):
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    # Chat history management
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    with col1:
+        st.write(f"💬 チャット履歴: {len(st.session_state.chat_history)}件")
+
+    with col2:
+        if st.button("🗑️ 履歴クリア", help="チャット履歴をすべてクリアします"):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    with col3:
+        max_history = st.selectbox(
+            "最大履歴数",
+            options=[10, 20, 50, 100],
+            index=1,  # Default to 20 (index 1)
+            help="保持するチャット履歴の最大数"
+        )
+
+    # Limit chat history to prevent memory issues
+    if len(st.session_state.chat_history) > max_history:
+        st.session_state.chat_history = st.session_state.chat_history[-max_history:]
+
     # Display chat history
-    for chat in st.session_state.chat_history:
+    for i, chat in enumerate(st.session_state.chat_history):
         with st.chat_message(chat["role"]):
             st.write(chat["content"])
             if "dataframe" in chat:
-                st.dataframe(chat["dataframe"])
+                # Limit dataframe display size for performance
+                df_display = chat["dataframe"]
+                if len(df_display) > 100:
+                    st.write(f"📊 データ件数: {len(df_display)}件 (上位100件を表示)")
+                    df_display = df_display.head(100)
+                st.dataframe(df_display, use_container_width=True, height=300)
 
     # Chat input
     if prompt := st.chat_input("質問を入力してください"):
-        # Add user message to chat history
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        # Ensure chat history list exists and is writable
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
 
-        with st.chat_message("user"):
-            st.write(prompt)
+        # Limit prompt length to prevent API issues
+        if len(prompt) > 1000:
+            st.warning("質問が長すぎます。1000文字以内で入力してください。")
+        else:
+            # Add user message to chat history
+            try:
+                st.session_state.chat_history.append({"role": "user", "content": prompt})
 
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("分析中..."):
-                try:
-                    # Get available columns
-                    available_columns = list(set(df_cases.columns.tolist() + df_parts.columns.tolist()))
+                with st.chat_message("user"):
+                    st.write(prompt)
 
-                    # Generate query specification
-                    spec = llm_to_json_spec(prompt, available_columns)
+                # Generate response
+                with st.chat_message("assistant"):
+                    with st.spinner("分析中..."):
+                        try:
+                            # Get available columns
+                            available_columns = list(set(df_cases.columns.tolist() + df_parts.columns.tolist()))
 
-                    if spec:
-                        # Debug information (show in expander)
-                        with st.expander("🔍 デバッグ情報"):
-                            st.json(spec)
-                            st.write(f"利用可能な列: {len(available_columns)}個")
-                            st.write(f"対象データ: {'部品データ' if any('部品' in str(metric.get('expr', '')) for metric in spec.get('metrics', [])) else '案件データ'}")
+                            # Generate query specification
+                            spec = llm_to_json_spec(prompt, available_columns)
 
-                        # Execute query
-                        result_df = execute_spec(df_cases, df_parts, spec)
+                            if spec:
+                                # Debug information (show in expander)
+                                with st.expander("🔍 デバッグ情報"):
+                                    st.json(spec)
+                                    st.write(f"利用可能な列: {len(available_columns)}個")
+                                    st.write(f"対象データ: {'部品データ' if any('部品' in str(metric.get('expr', '')) for metric in spec.get('metrics', [])) else '案件データ'}")
 
-                        if not result_df.empty:
-                            # Generate natural language response
-                            response_text = generate_natural_response(prompt, result_df, spec)
+                                # Execute query
+                                result_df = execute_spec(df_cases, df_parts, spec)
 
-                            st.write(response_text)
-                            st.dataframe(result_df, use_container_width=True)
+                                if not result_df.empty:
+                                    # Generate natural language response
+                                    response_text = generate_natural_response(prompt, result_df, spec)
 
-                            # Add to chat history
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": response_text,
-                                "dataframe": result_df
-                            })
-                        else:
-                            # More specific error message with debugging info
-                            error_msg = "該当するデータが見つかりませんでした。\n\n"
+                                    st.write(response_text)
+                                    st.dataframe(result_df, use_container_width=True)
 
-                            # Show what was searched
-                            if spec.get('filters'):
-                                error_msg += "適用されたフィルタ:\n"
-                                for f in spec.get('filters', []):
-                                    error_msg += f"• {f.get('column')} {f.get('op')} {f.get('value')}\n"
+                                    # Add to chat history
+                                    st.session_state.chat_history.append({
+                                        "role": "assistant",
+                                        "content": response_text,
+                                        "dataframe": result_df
+                                    })
+                                else:
+                                    # More specific error message with debugging info
+                                    error_msg = "該当するデータが見つかりませんでした。\n\n"
 
-                            if spec.get('time_range', {}).get('from') or spec.get('time_range', {}).get('to'):
-                                error_msg += f"期間: {spec.get('time_range', {}).get('from', '始期なし')} - {spec.get('time_range', {}).get('to', '終期なし')}\n"
+                                    # Show what was searched
+                                    if spec.get('filters'):
+                                        error_msg += "適用されたフィルタ:\n"
+                                        for f in spec.get('filters', []):
+                                            error_msg += f"• {f.get('column')} {f.get('op')} {f.get('value')}\n"
 
-                            error_msg += "\n💡 以下をお試しください:\n"
-                            error_msg += "• より広い条件で検索する\n"
-                            error_msg += "• 期間を変更する\n"
-                            error_msg += "• 異なる項目で集計する"
+                                    if spec.get('time_range', {}).get('from') or spec.get('time_range', {}).get('to'):
+                                        time_from = spec.get('time_range', {}).get('from', '始期なし')
+                                        time_to = spec.get('time_range', {}).get('to', '終期なし')
+                                        error_msg += f"期間: {time_from} - {time_to}\n"
 
-                            st.write(error_msg)
+                                    # Show expected columns vs available columns
+                                    expected_metrics = [m.get('name', 'unknown') for m in spec.get('metrics', [])]
+                                    if expected_metrics:
+                                        error_msg += f"期待されるメトリクス: {', '.join(expected_metrics)}\n"
+
+                                    error_msg += "\n💡 以下をお試しください:\n"
+                                    error_msg += "• より広い条件で検索する\n"
+                                    error_msg += "• 期間を変更する\n"
+                                    error_msg += "• 異なる項目で集計する\n"
+                                    error_msg += "• より一般的なキーワードを使用する"
+
+                                    st.write(error_msg)
+                                    st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+                            else:
+                                error_msg = "質問を理解できませんでした。\n\n💡 以下のような質問をお試しください:\n"
+                                error_msg += "• 「全体の件数は？」\n"
+                                error_msg += "• 「機種別の件数を教えて」\n"
+                                error_msg += "• 「今月の不具合件数は？」\n"
+                                error_msg += "• 「症状別の件数ランキング」"
+                                st.write(error_msg)
+                                st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+
+                        except Exception as e:
+                            error_msg = f"エラーが発生しました: {str(e)}"
+                            st.error(error_msg)
                             st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
-                    else:
-                        error_msg = "質問を理解できませんでした。\n\n💡 以下のような質問をお試しください:\n"
-                        error_msg += "• 「全体の件数は？」\n"
-                        error_msg += "• 「機種別の件数を教えて」\n"
-                        error_msg += "• 「今月の不具合件数は？」\n"
-                        error_msg += "• 「症状別の件数ランキング」"
-                        st.write(error_msg)
-                        st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
 
-                except Exception as e:
-                    error_msg = f"エラーが発生しました: {str(e)}"
-                    st.error(error_msg)
-                    st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+            except Exception as e:
+                # Handle outer exception for chat history operations
+                st.error(f"チャット処理エラー: {str(e)}")
+                if "chat_history" in st.session_state:
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": f"処理中にエラーが発生しました: {str(e)}"
+                    })
 
 # ---------- Main Application ----------
 

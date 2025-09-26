@@ -1,26 +1,44 @@
 # KUBOTADiag.py
 
 import os
-import io
 import re
 import json
-import datetime as dt
 import unicodedata
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from openai import OpenAI
-from dateutil.relativedelta import relativedelta
 from rapidfuzz import fuzz
-try:
-    from rag_enhanced_search import RAGEnhancedSearchSystem, create_enhanced_search_system
-except ImportError:
-    RAGEnhancedSearchSystem = None
-    create_enhanced_search_system = None
+# Lazy import for RAG functionality to avoid heavy dependency loading at startup
+RAGEnhancedSearchSystem = None
+create_enhanced_search_system = None
+LightweightRAGSystem = None
+create_lightweight_rag_system = None
+
+def _lazy_import_rag():
+    """Lazy import of RAG functionality with fallback to lightweight version"""
+    global RAGEnhancedSearchSystem, create_enhanced_search_system, LightweightRAGSystem, create_lightweight_rag_system
+
+    if RAGEnhancedSearchSystem is None:
+        try:
+            from rag_enhanced_search import RAGEnhancedSearchSystem, create_enhanced_search_system
+        except ImportError:
+            pass
+        except Exception:
+            # Handle other import errors (like Bus errors from heavy dependencies)
+            pass
+
+    if LightweightRAGSystem is None:
+        try:
+            from lightweight_rag import LightweightRAGSystem, create_lightweight_rag_system
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    return RAGEnhancedSearchSystem, create_enhanced_search_system, LightweightRAGSystem, create_lightweight_rag_system
 
 # Import fallback search functionality
 try:
@@ -390,7 +408,7 @@ def render_dashboard(df_cases: pd.DataFrame, df_parts: pd.DataFrame, filters: Di
             )
             st.plotly_chart(fig, use_container_width=True)
 
-def render_additional_kpis(df_cases: pd.DataFrame, df_parts: pd.DataFrame):
+def render_additional_kpis(df_cases: pd.DataFrame, _: pd.DataFrame):
     """Render additional KPI visualizations"""
 
     st.header("📈 追加KPI")
@@ -515,32 +533,83 @@ def render_quality_report(df: pd.DataFrame):
 
 # ---------- RAG-Enhanced Search Integration ----------
 
-def initialize_rag_system(df_cases: pd.DataFrame, df_parts: pd.DataFrame) -> Optional['RAGEnhancedSearchSystem']:
+def initialize_rag_system(df_cases: pd.DataFrame, df_parts: pd.DataFrame) -> Optional[object]:
     """Initialize RAG-enhanced search system with maintenance data"""
     try:
-        if create_enhanced_search_system is None:
-            st.warning("RAG機能が利用できません。依存関係をインストールしてください:")
-            st.code("uv add sentence-transformers faiss-cpu langchain")
-            return None
+        # Lazy import RAG functionality
+        RAGEnhancedSearchSystem, create_func, LightweightRAGSystem, create_lightweight_func = _lazy_import_rag()
 
+        # Try enhanced RAG first, fallback to lightweight
+        if create_func is not None:
+            try:
+                # Check if OpenAI API key is available
+                if not os.environ.get('OPENAI_API_KEY'):
+                    st.warning("OPENAI_API_KEYが設定されていません。軽量RAGシステムを使用します。")
+                    return _initialize_lightweight_rag(df_cases, df_parts, create_lightweight_func)
+
+                # Combine cases and parts data for comprehensive search
+                combined_df = pd.concat([df_cases, df_parts], ignore_index=True)
+
+                if combined_df.empty:
+                    st.warning("データがありません。RAGシステムを初期化できません。")
+                    return None
+
+                # Initialize enhanced RAG system
+                with st.spinner("高機能RAGシステムを初期化中..."):
+                    rag_system = create_func(combined_df)
+
+                if rag_system is None:
+                    st.info("高機能RAGシステムの初期化に失敗しました。軽量RAGシステムを使用します。")
+                    return _initialize_lightweight_rag(df_cases, df_parts, create_lightweight_func)
+                else:
+                    st.success("高機能RAGシステムが正常に初期化されました。")
+                    return rag_system
+
+            except Exception as e:
+                st.warning(f"高機能RAGシステムでエラーが発生: {str(e)}")
+                st.info("軽量RAGシステムにフォールバックします。")
+                return _initialize_lightweight_rag(df_cases, df_parts, create_lightweight_func)
+
+        else:
+            return _initialize_lightweight_rag(df_cases, df_parts, create_lightweight_func)
+
+    except Exception as e:
+        st.error(f"RAGシステムの初期化でエラーが発生しました: {str(e)}")
+        return None
+
+def _initialize_lightweight_rag(df_cases: pd.DataFrame, df_parts: pd.DataFrame, create_lightweight_func) -> Optional[object]:
+    """Initialize lightweight RAG system"""
+    if create_lightweight_func is None:
+        st.info("軽量RAG機能が利用できません。従来の検索機能を使用します。")
+        return None
+
+    try:
         # Combine cases and parts data for comprehensive search
         combined_df = pd.concat([df_cases, df_parts], ignore_index=True)
 
-        # Initialize RAG system
-        rag_system = create_enhanced_search_system(combined_df)
+        # Check if we have enough data
+        if combined_df.empty:
+            st.warning("データがありません。RAGシステムを初期化できません。")
+            return None
+
+        # Initialize lightweight RAG system
+        with st.spinner("軽量RAGシステムを初期化中..."):
+            rag_system = create_lightweight_func(combined_df)
 
         if rag_system is None:
-            st.warning("RAGシステムの初期化に失敗しました。従来の検索機能を使用します。")
+            st.info("軽量RAGシステムの初期化に失敗しました。従来の検索機能を使用します。")
+            return None
+        else:
+            st.success("軽量RAGシステムが正常に初期化されました。")
+            return rag_system
 
-        return rag_system
     except Exception as e:
-        st.error(f"RAGシステムの初期化に失敗しました: {str(e)}")
-        st.info("必要な依存関係をインストールしてください:")
-        st.code("uv add sentence-transformers faiss-cpu langchain langchain-community")
+        st.warning(f"軽量RAGシステムの初期化でエラーが発生しました: {str(e)}")
+        st.info("従来の検索機能を使用します。")
         return None
 
-def rag_enhanced_query(question: str, df_cases: pd.DataFrame, df_parts: pd.DataFrame):
-    """Perform RAG-enhanced query for improved search accuracy"""
+def rag_enhanced_query(question: str, df_cases: pd.DataFrame, df_parts: pd.DataFrame, **kwargs):
+    """Perform RAG-enhanced query for improved search accuracy with better error handling"""
 
     # Initialize RAG system if not already done
     if 'rag_system' not in st.session_state:
@@ -550,46 +619,104 @@ def rag_enhanced_query(question: str, df_cases: pd.DataFrame, df_parts: pd.DataF
     rag_system = st.session_state.rag_system
 
     if rag_system is None:
+        st.info("RAGシステムが利用できません。従来の検索方式を使用します。")
         # Fallback to original LLM query if RAG system fails
         return llm_enhanced_query(question, df_cases, df_parts)
 
     try:
-        # Perform RAG-enhanced search
-        response, search_results = rag_system.search_and_generate(
-            query=question,
-            filters=None,
-            top_k=10,
-            semantic_weight=0.7
-        )
+        # Get parameters from kwargs or use defaults
+        top_k = kwargs.get('top_k', 15)
+        semantic_weight = kwargs.get('semantic_weight', 0.6)
+
+        # Show RAG search progress
+        with st.spinner("RAG検索を実行中..."):
+            # Perform RAG-enhanced search with user-specified parameters
+            response, search_results = rag_system.search_and_generate(
+                query=question,
+                filters=None,
+                top_k=top_k,
+                semantic_weight=semantic_weight
+            )
 
         # Convert search results to DataFrame for display
         if search_results:
             result_data = []
-            for result in search_results:
+            for i, result in enumerate(search_results[:10]):  # Show top 10 results
+                # Create more informative display
+                content_preview = result.content[:300] + "..." if len(result.content) > 300 else result.content
+
+                # Extract key metadata for display
+                metadata = result.metadata
+                metadata_display = []
+
+                if isinstance(metadata, dict):
+                    if metadata.get('machine_model'):
+                        metadata_display.append(f"機種: {metadata['machine_model']}")
+                    if metadata.get('category'):
+                        metadata_display.append(f"カテゴリ: {metadata['category']}")
+                    if metadata.get('case_no'):
+                        metadata_display.append(f"案件: {metadata['case_no']}")
+                    if metadata.get('work_date'):
+                        metadata_display.append(f"日付: {metadata['work_date']}")
+
+                metadata_str = " | ".join(metadata_display) if metadata_display else str(metadata)[:100]
+
                 result_data.append({
+                    '順位': i + 1,
                     'スコア': f"{result.score:.3f}",
-                    '内容': result.content[:200] + "..." if len(result.content) > 200 else result.content,
-                    'メタデータ': str(result.metadata)[:100] + "..." if len(str(result.metadata)) > 100 else str(result.metadata)
+                    '関連内容': content_preview,
+                    '詳細情報': metadata_str
                 })
 
             results_df = pd.DataFrame(result_data)
+
+            # Add summary information
+            avg_score = sum(r.score for r in search_results) / len(search_results)
+            st.info(f"🔍 RAG検索結果: {len(search_results)}件の関連情報を発見（平均関連度: {avg_score:.3f}）")
+
         else:
             results_df = pd.DataFrame()
+            st.warning("RAG検索で関連情報が見つかりませんでした。")
 
         return response, results_df
 
     except Exception as e:
-        st.error(f"RAG検索でエラーが発生しました: {str(e)}")
+        error_msg = f"RAG検索でエラーが発生しました: {str(e)}"
+        st.error(error_msg)
+
+        # Provide more detailed error information if available
+        if "OpenAI" in str(e):
+            st.error("OpenAI APIの問題が発生しました。APIキーまたはネットワーク接続を確認してください。")
+        elif "FAISS" in str(e) or "vector" in str(e).lower():
+            st.error("ベクトル検索の問題が発生しました。システムを再初期化してください。")
+        elif "DuckDB" in str(e):
+            st.error("データベース検索の問題が発生しました。")
+
+        # Reset RAG system on critical errors
+        if "FAISS" in str(e) or "vector" in str(e).lower():
+            st.session_state.pop('rag_system', None)
+            st.info("RAGシステムをリセットしました。次回の検索時に再初期化されます。")
+
         # Fallback to original method
+        st.info("従来の検索方式にフォールバックします。")
         return llm_enhanced_query(question, df_cases, df_parts)
 
 def llm_enhanced_query(question: str, df_cases: pd.DataFrame, df_parts: pd.DataFrame):
     """Enhanced LLM query (original method with improvements)"""
     try:
+        # Debug output
+        st.write(f"🔍 分析開始: {question}")
+
+        # Check if dataframes are available
+        if df_cases.empty and df_parts.empty:
+            return "データが読み込まれていません。データファイルを確認してください。", pd.DataFrame()
+
         # Get available columns
         available_columns = list(set(df_cases.columns.tolist() + df_parts.columns.tolist()))
+        st.write(f"📊 利用可能な列数: {len(available_columns)}")
 
         # Generate query specification
+        st.write("🤖 OpenAI APIに問い合わせ中...")
         spec = llm_to_json_spec(question, available_columns)
 
         if spec:
@@ -666,34 +793,62 @@ def llm_to_json_spec(question: str, columns: List[str]) -> Dict[str, Any]:
 JSONのみを出力してください。説明は不要です。"""
 
     try:
+        st.write("🌐 OpenAI APIに接続中...")
+        st.write(f"📝 使用モデル: gpt-4o-mini")
+        st.write(f"🔑 APIキー確認: {'✅' if api_key else '❌'}")
+
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
             ],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1000,
+            timeout=30  # Add timeout to prevent hanging
         )
 
+        st.write("✅ OpenAI APIレスポンス受信完了")
         json_text = response.choices[0].message.content.strip()
         # Remove code block markers if present
         json_text = re.sub(r'^```json\s*|\s*```$', '', json_text, flags=re.MULTILINE)
 
-        return json.loads(json_text)
+        parsed_json = json.loads(json_text)
+        st.write("✅ JSONパース成功")
+        return parsed_json
 
+    except json.JSONDecodeError as e:
+        st.error(f"JSON解析エラー: {str(e)}")
+        st.write("受信したテキスト:", json_text if 'json_text' in locals() else "N/A")
+        return {}
     except Exception as e:
         error_msg = f"OpenAI API エラー: {str(e)}"
+        error_type = type(e).__name__
+
+        # More detailed error information
+        st.error(f"[{error_type}] {error_msg}")
+        st.write("🔍 詳細エラー情報:")
+        st.write(f"   - エラータイプ: {error_type}")
+        st.write(f"   - エラーメッセージ: {str(e)}")
 
         # Add helpful information for common errors
         if "API key" in str(e) or "authentication" in str(e).lower():
-            error_msg += "\n\n💡 API キーを確認してください"
+            st.write("💡 API キーを確認してください")
         elif "rate limit" in str(e).lower() or "quota" in str(e).lower():
-            error_msg += "\n\n💡 API使用量制限に達しました。しばらく待ってから再試行してください"
+            st.write("💡 API使用量制限に達しました。しばらく待ってから再試行してください")
         elif "timeout" in str(e).lower():
-            error_msg += "\n\n💡 接続がタイムアウトしました。再試行してください"
+            st.write("💡 接続がタイムアウトしました。再試行してください")
+        elif "404" in str(e):
+            st.write("💡 **404エラー発生** - モデル名またはエンドポイントに問題があります")
+            st.write(f"   - 使用モデル: gpt-4o-mini")
+            import openai as openai_lib
+            st.write(f"   - OpenAIバージョン: {openai_lib.__version__}")
 
-        st.error(error_msg)
+        # Import traceback for more details
+        import traceback
+        st.write("📊 完全なトレースバック:")
+        st.code(traceback.format_exc())
+
         return {}
 
 def execute_spec(df_cases: pd.DataFrame, df_parts: pd.DataFrame, spec: Dict[str, Any]) -> pd.DataFrame:
@@ -878,7 +1033,7 @@ def execute_spec(df_cases: pd.DataFrame, df_parts: pd.DataFrame, spec: Dict[str,
         st.error(error_msg)
         return pd.DataFrame()
 
-def generate_natural_response(question: str, result_df: pd.DataFrame, spec: Dict[str, Any]) -> str:
+def generate_natural_response(question: str, result_df: pd.DataFrame, _: Dict[str, Any]) -> str:
     """Generate natural language response for query results"""
 
     api_key = os.environ.get('OPENAI_API_KEY')
@@ -913,7 +1068,7 @@ def generate_natural_response(question: str, result_df: pd.DataFrame, spec: Dict
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": result_summary}
@@ -932,13 +1087,92 @@ def qa_chat(df_cases: pd.DataFrame, df_parts: pd.DataFrame):
     st.header("💬 QAチャット")
     st.write("データベースの内容について質問してください。")
 
-    # Show example questions
+    # Search mode selection
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        search_mode = st.radio(
+            "🔍 検索モード選択",
+            options=["RAG検索", "LLM検索", "自動選択"],
+            index=2,  # Default to auto-select
+            horizontal=True,
+            help="""
+            - RAG検索: 高精度なベクトル検索 + LLM回答生成
+            - LLM検索: 従来のOpenAI API + 構造化検索
+            - 自動選択: システムが最適な検索方法を自動選択
+            """
+        )
+
+    with col2:
+        col2a, col2b = st.columns(2)
+        with col2a:
+            if st.button("🔄 RAG再初期化", help="RAGシステムを再初期化します"):
+                if 'rag_system' in st.session_state:
+                    del st.session_state.rag_system
+                st.rerun()
+
+        with col2b:
+            compare_mode = st.checkbox(
+                "⚖️ 比較モード",
+                value=False,
+                help="RAG検索とLLM検索の結果を並べて比較表示"
+            )
+
+    # Show system status based on search mode
+    if search_mode == "RAG検索":
+        if 'rag_system' in st.session_state and st.session_state.rag_system is not None:
+            st.success("🚀 RAG検索システムが有効です")
+        else:
+            st.warning("⚠️ RAGシステムが利用できません。LLM検索を使用してください。")
+    elif search_mode == "LLM検索":
+        st.info("🤖 LLM検索モードを使用中")
+    else:  # 自動選択
+        if 'rag_system' in st.session_state and st.session_state.rag_system is not None:
+            st.success("🚀 RAG検索システムが利用可能（自動選択モード）")
+        else:
+            st.info("🤖 LLM検索システムを使用中（自動選択モード）")
+
+    # Advanced settings for RAG search (expandable)
+    if search_mode == "RAG検索":
+        with st.expander("⚙️ RAG検索の詳細設定"):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                top_k = st.slider(
+                    "検索結果数",
+                    min_value=5,
+                    max_value=20,
+                    value=10,
+                    help="RAG検索で取得する関連文書の数"
+                )
+
+            with col2:
+                semantic_weight = st.slider(
+                    "セマンティック重み",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.7,
+                    step=0.1,
+                    help="ベクトル検索vs構造化検索のバランス（1.0=完全ベクトル検索）"
+                )
+
+            with col3:
+                use_filters = st.checkbox(
+                    "フィルタ適用",
+                    value=False,
+                    help="サイドバーのフィルタをRAG検索にも適用"
+                )
+
     st.info("💡 質問例:\n" +
             "・「オイル漏れの件数は？」\n" +
             "・「エンジン関連の故障を教えて」\n" +
             "・「今年のトラブル上位3位は？」\n" +
             "・「油圧系統の問題があった機種は？」\n" +
-            "・「最近のポンプ交換の傾向は？」")
+            "・「最近のポンプ交換の傾向は？」\n" +
+            "・「U-30シリーズの故障パターン」\n" +
+            "・「高稼働時間での不具合傾向」\n" +
+            "・「予防保全のポイントは？」\n" +
+            "・「部品交換コストが高い修理は？」")
 
     # Check for OpenAI API key
     if not os.environ.get('OPENAI_API_KEY'):
@@ -973,7 +1207,7 @@ def qa_chat(df_cases: pd.DataFrame, df_parts: pd.DataFrame):
         st.session_state.chat_history = st.session_state.chat_history[-max_history:]
 
     # Display chat history
-    for i, chat in enumerate(st.session_state.chat_history):
+    for chat in st.session_state.chat_history:
         with st.chat_message(chat["role"]):
             st.write(chat["content"])
             if "dataframe" in chat:
@@ -1005,35 +1239,99 @@ def qa_chat(df_cases: pd.DataFrame, df_parts: pd.DataFrame):
                 with st.chat_message("assistant"):
                     with st.spinner("分析中..."):
                         try:
-                            # Check if RAG system is available
-                            if RAGEnhancedSearchSystem is not None:
-                                search_method = st.selectbox(
-                                    "検索方式",
-                                    ["RAG拡張検索 (推奨)", "従来のLLM検索"],
-                                    index=0,
-                                    help="RAG拡張検索は意味的類似性を考慮してより精度の高い結果を提供します"
-                                )
+                            # Debug: Check OPENAI_API_KEY availability
+                            api_key = os.environ.get('OPENAI_API_KEY')
+                            if not api_key:
+                                st.error("OPENAI_API_KEYが設定されていません。環境変数を確認してください。")
+                                return
 
-                                if search_method == "RAG拡張検索 (推奨)":
-                                    # Use RAG-enhanced search
-                                    response_text, result_df = rag_enhanced_query(prompt, df_cases, df_parts)
-                                else:
-                                    # Use original LLM search
-                                    response_text, result_df = llm_enhanced_query(prompt, df_cases, df_parts)
+                            # Check if comparison mode is enabled
+                            if compare_mode:
+                                # Compare both search methods side by side
+                                st.info("⚖️ 比較モード: 両方の検索方法を実行中...")
+
+                                col_rag, col_llm = st.columns(2)
+
+                                with col_rag:
+                                    st.subheader("🚀 RAG検索結果")
+                                    try:
+                                        rag_params = {}
+                                        if 'top_k' in locals():
+                                            rag_params['top_k'] = top_k
+                                        if 'semantic_weight' in locals():
+                                            rag_params['semantic_weight'] = semantic_weight
+
+                                        rag_response, rag_df = rag_enhanced_query(
+                                            prompt, df_cases, df_parts, **rag_params
+                                        )
+                                        st.write(rag_response)
+                                        if not rag_df.empty:
+                                            st.dataframe(rag_df, use_container_width=True)
+                                    except Exception as e:
+                                        st.error(f"RAG検索エラー: {str(e)}")
+
+                                with col_llm:
+                                    st.subheader("🤖 LLM検索結果")
+                                    try:
+                                        llm_response, llm_df = llm_enhanced_query(prompt, df_cases, df_parts)
+                                        st.write(llm_response)
+                                        if not llm_df.empty:
+                                            st.dataframe(llm_df, use_container_width=True)
+                                    except Exception as e:
+                                        st.error(f"LLM検索エラー: {str(e)}")
+
+                                # Use RAG response for chat history (prioritize RAG)
+                                response_text = rag_response if 'rag_response' in locals() else llm_response if 'llm_response' in locals() else "比較モードでエラーが発生しました。"
+                                result_df = rag_df if 'rag_df' in locals() and not rag_df.empty else llm_df if 'llm_df' in locals() else pd.DataFrame()
+
                             else:
-                                # RAG system not available, use original method
-                                st.warning("RAG拡張検索が利用できません。従来の検索方式を使用します。")
-                                response_text, result_df = llm_enhanced_query(prompt, df_cases, df_parts)
+                                # Select search method based on user choice
+                                if search_mode == "RAG検索":
+                                    # Force RAG search with custom parameters
+                                    st.info("🚀 RAG検索を実行中...")
 
-                            # Display response
-                            st.write(response_text)
+                                    # Get RAG parameters from UI (if available)
+                                    rag_params = {}
+                                    if 'top_k' in locals():
+                                        rag_params['top_k'] = top_k
+                                    if 'semantic_weight' in locals():
+                                        rag_params['semantic_weight'] = semantic_weight
 
-                            if not result_df.empty:
-                                # Show result type
-                                if RAGEnhancedSearchSystem is not None and 'search_method' in locals() and search_method == "RAG拡張検索 (推奨)":
-                                    st.info("🔍 RAG拡張検索結果 - 意味的類似性とキーワードマッチングを組み合わせた結果")
+                                    response_text, result_df = rag_enhanced_query(
+                                        prompt, df_cases, df_parts, **rag_params
+                                    )
+                                elif search_mode == "LLM検索":
+                                    # Force LLM search
+                                    st.info("🤖 LLM検索を実行中...")
+                                    response_text, result_df = llm_enhanced_query(prompt, df_cases, df_parts)
+                                else:  # 自動選択
+                                    # Auto-select: Try RAG first, fallback to LLM
+                                    try:
+                                        st.info("🔍 自動選択: RAG検索を試行中...")
+                                        response_text, result_df = rag_enhanced_query(prompt, df_cases, df_parts)
+                                        st.success("✅ RAG検索で回答を生成しました")
+                                    except Exception as rag_error:
+                                        st.warning(f"RAG検索でエラーが発生: {str(rag_error)}")
+                                        st.info("🔄 LLM検索にフォールバックします...")
+                                        response_text, result_df = llm_enhanced_query(prompt, df_cases, df_parts)
+                                        st.success("✅ LLM検索で回答を生成しました")
 
-                                st.dataframe(result_df, use_container_width=True)
+                            # Display response (only if not in compare mode)
+                            if not compare_mode:
+                                st.write(response_text)
+
+                                if not result_df.empty:
+                                    st.success("✅ 検索完了")
+
+                                    # Show search method used
+                                    if search_mode == "RAG検索":
+                                        st.info(f"🚀 RAG検索結果 (top_k={top_k if 'top_k' in locals() else 15}, semantic_weight={semantic_weight if 'semantic_weight' in locals() else 0.6})")
+                                    elif search_mode == "LLM検索":
+                                        st.info("🤖 LLM検索結果")
+                                    else:
+                                        st.info("🔍 自動選択検索結果")
+
+                                    st.dataframe(result_df, use_container_width=True)
 
                                 # Add to chat history
                                 st.session_state.chat_history.append({

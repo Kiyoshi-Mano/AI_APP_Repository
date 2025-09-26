@@ -5,3 +5,6 @@ build:
   runtime: python3.11
   package_manager: uv
   entrypoint: KUBOTAD.py
+
+deploy:
+  port: 8503

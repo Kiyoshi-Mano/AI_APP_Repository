@@ -544,7 +544,7 @@ JSONのみを出力してください。説明は不要です。"""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
@@ -790,7 +790,7 @@ def generate_natural_response(question: str, result_df: pd.DataFrame, spec: Dict
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": result_summary}
