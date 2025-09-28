@@ -1,0 +1,2 @@
+# Force display of lock files in GitHub diffs
+uv.lock -linguist-generated
